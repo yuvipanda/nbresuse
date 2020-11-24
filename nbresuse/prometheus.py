@@ -1,7 +1,11 @@
 from typing import Optional
 
-from notebook.notebookapp import NotebookApp
+import sys
+
+from tornado import gen
+from notebook.utils import maybe_future
 from prometheus_client import Gauge
+from psutil import process_iter, AccessDenied, NoSuchProcess
 
 from nbresuse.metrics import PSUtilMetricsLoader
 
@@ -18,14 +22,21 @@ class PrometheusHandler(Callable):
         self.metricsloader = metricsloader
         self.config = metricsloader.config
         self.session_manager = metricsloader.nbapp.session_manager
+        self.kernel_spec_manager = metricsloader.nbapp.kernel_spec_manager
 
-        gauge_names = ["total_memory", "max_memory", "total_cpu", "max_cpu"]
+        gauge_names = ["total_memory", "max_memory", "total_cpu", "max_cpu", "kernel_memory"]
         for name in gauge_names:
             phrase = name + "_usage"
-            gauge = Gauge(phrase, "counter for " + phrase.replace("_", " "), [])
+            if name == "kernel_memory":
+                label = ['kernel_id']
+            else:
+                label = []
+            gauge = Gauge(phrase, "counter for " + phrase.replace("_", " "), label)
             setattr(self, phrase.upper(), gauge)
 
-    async def __call__(self, *args, **kwargs):
+    @gen.coroutine
+    def __call__(self, *args, **kwargs):
+        yield self.kernel_metrics()
         memory_metric_values = self.metricsloader.memory_metrics()
         if memory_metric_values is not None:
             self.TOTAL_MEMORY_USAGE.set(memory_metric_values["memory_info_rss"])
@@ -61,3 +72,56 @@ class PrometheusHandler(Callable):
                 return self.config.cpu_limit
             else:
                 return 100.0 * cpu_metric_values["cpu_count"]
+
+    @gen.coroutine
+    def kernel_metrics(self):
+        kernels = yield maybe_future(self._list_kernel_memory())
+        for kernel_id, data in kernels.items():
+            self.KERNEL_MEMORY_USAGE.labels(kernel_id=kernel_id).set(data['rss'])
+
+    @gen.coroutine
+    def _list_kernel_memory(self):
+        kernel_memory = dict()
+
+        sessions = yield maybe_future(self.session_manager.list_sessions())
+        specs = yield maybe_future(self.kernel_spec_manager.get_all_specs())
+        kernel_processes = PrometheusHandler._kernel_processes(specs)
+
+        def find_process(kernel_id):
+            for proc in kernel_processes:
+                cmd = proc.cmdline()
+                if cmd:
+                    last_arg = cmd[-1]
+                    if kernel_id in last_arg:
+                        return proc
+            return None
+
+        for session in sessions:
+            kernel = session['kernel']
+            kernel_id = kernel['id']
+            kernel_process = find_process(kernel_id)
+            if kernel_process:
+                kernel_memory[kernel_id] = kernel_process.memory_info()._asdict()
+
+        raise gen.Return(kernel_memory)
+
+    @staticmethod
+    def _kernel_processes(kernel_specs):
+        keys = []
+        for kernel_spec in kernel_specs.values():
+            for each_spec in kernel_spec.values():
+                if 'argv' in each_spec:
+                    keys.append(each_spec.get('argv'))
+
+        for proc in process_iter():
+            try:
+                for key in keys:
+                    if key[0] in {'python',
+                                  'python%i' % sys.version_info[0],
+                                  'python%i.%i' % sys.version_info[:2]}:
+                        key[0] = sys.executable
+                    key = " ".join(key[:-1])
+                    if key in " ".join(proc.cmdline()):
+                        yield proc
+            except (AccessDenied, NoSuchProcess, OSError):
+                pass
